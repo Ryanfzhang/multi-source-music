@@ -307,6 +307,8 @@ class ResBlock(TimestepBlock):
         )
 
     def _forward(self, x, emb):
+        N = emb.shape[0]
+        B = x.shape[0]//N
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -316,8 +318,8 @@ class ResBlock(TimestepBlock):
         else:
             h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
+        emb_out = emb_out[None, ..., None, None].expand(B, -1, -1, -1, -1)
+        emb_out = emb_out.reshape(x.shape[0], -1, 1, 1)
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(emb_out, 2, dim=1)
@@ -607,10 +609,10 @@ class UNetModel(nn.Module):
         else:
             spatial_transformer_no_context = False
 
-        if use_spatial_transformer and not spatial_transformer_no_context:
-            assert (
-                context_dim is not None
-            ), "Fool!! You forgot to include the dimension of your cross-attention conditioning..."
+        # if use_spatial_transformer and not spatial_transformer_no_context:
+            # assert (
+            #     context_dim is not None
+            # ), "Fool!! You forgot to include the dimension of your cross-attention conditioning..."
 
         if context_dim is not None and not spatial_transformer_no_context:
             assert (
@@ -857,6 +859,12 @@ class UNetModel(nn.Module):
 
         self.shape_reported = False
 
+        self.switcher = nn.Parameter(th.eye(4), requires_grad=False)
+        self.switcher_transform = nn.Sequential(nn.Linear(4, 128), 
+        nn.ReLU(), 
+        nn.Linear(128, time_embed_dim)
+        )
+
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.
@@ -882,16 +890,20 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional. an [N, extra_film_condition_dim] Tensor if film-embed conditional
         :return: an [N x C x ...] Tensor of outputs.
         """
+        B, N, C, T, F = x.shape
+        x = x.reshape(B*N, C, T, F)
         if not self.shape_reported:
             print("The shape of UNet input is", x.size())
             self.shape_reported = True
 
-        assert (y is not None) == (
-            self.num_classes is not None or self.extra_film_condition_dim is not None
-        ), "must specify y if and only if the model is class-conditional or film embedding conditional"
+        # assert (y is not None) == (
+        #     self.num_classes is not None or self.extra_film_condition_dim is not None
+        # ), "must specify y if and only if the model is class-conditional or film embedding conditional"
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
+        switch_emb = self.switcher_transform(self.switcher)
+
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
@@ -900,13 +912,13 @@ class UNetModel(nn.Module):
         if self.use_extra_film_by_addition:
             emb = emb + self.film_emb(y)
         elif self.use_extra_film_by_concat:
-            emb = th.cat([emb, self.film_emb(y)], dim=-1)
+            emb = th.cat([emb.expand(N, -1), switch_emb], dim=-1)
 
         h = x.type(self.dtype)
-        h, mix = th.chunk(h, chunks=2, dim=2)
+        h, mix = th.chunk(h, chunks=2, dim=1)
 
         mix_list = []
-        mix = mix[:, 0:1, :, :, :]
+        mix = mix[:, 0:1, :, :]
         mix_list.append(mix)
         for i in range(len(self.downsample_layers)):
             mix = self.downsample_layers[i](mix)
@@ -915,7 +927,7 @@ class UNetModel(nn.Module):
         # for module in self.input_blocks:
         for i, module in enumerate(self.input_blocks):
             mix_i = mix_list[i]
-            mix_to_add =  mix_i.repeat(1, h.shape[1], 1, 1, 1)
+            mix_to_add =  mix_i.repeat(1, h.shape[1], 1, 1)
             h = h + mix_to_add        
             h = module(h, emb, context)
             hs.append(h)
@@ -924,7 +936,7 @@ class UNetModel(nn.Module):
             h = th.cat([h, hs.pop()], dim=1)
 
             mix_i = mix_list[len(mix_list)-i-1]
-            mix_to_add =  mix_i.repeat(1, h.shape[1], 1, 1, 1)
+            mix_to_add =  mix_i.repeat(1, h.shape[1], 1, 1)
             h = h + mix_to_add
 
             h = module(h, emb, context)

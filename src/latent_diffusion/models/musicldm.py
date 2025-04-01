@@ -526,23 +526,23 @@ class DDPM(pl.LightningModule):
         assert self.training, "training step must be in training stage"
         self.warmup_step()
 
-        if (
-            self.state is None
-            and len(self.trainer.optimizers[0].state_dict()["state"].keys()) > 0
-        ):
-            self.state = (
-                self.trainer.optimizers[0].state_dict()["state"][0]["exp_avg"].clone()
-            )
-        elif self.state is not None and batch_idx % 1000 == 0:
-            assert (
-                torch.sum(
-                    torch.abs(
-                        self.state
-                        - self.trainer.optimizers[0].state_dict()["state"][0]["exp_avg"]
-                    )
-                )
-                > 1e-7
-            ), "Optimizer is not working"
+        # if (
+        #     self.state is None
+        #     and len(self.trainer.optimizers[0].state_dict()["state"].keys()) > 0
+        # ):
+        #     self.state = (
+        #         self.trainer.optimizers[0].state_dict()["state"][0]["exp_avg"].clone()
+        #     )
+        # elif self.state is not None and batch_idx % 1000 == 0:
+        #     assert (
+        #         torch.sum(
+        #             torch.abs(
+        #                 self.state
+        #                 - self.trainer.optimizers[0].state_dict()["state"][0]["exp_avg"]
+        #             )
+        #         )
+        #         > 1e-7
+        #     ), "Optimizer is not working"
 
         # if len(self.metrics_buffer.keys()) > 0:
         #     for k in self.metrics_buffer.keys():
