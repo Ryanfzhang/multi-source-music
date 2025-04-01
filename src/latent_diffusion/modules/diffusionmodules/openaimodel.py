@@ -18,6 +18,7 @@ from latent_diffusion.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from latent_diffusion.modules.attention import SpatialTransformer
+from einops import rearrange
 
 
 # dummy replace
@@ -891,7 +892,7 @@ class UNetModel(nn.Module):
         :return: an [N x C x ...] Tensor of outputs.
         """
         B, N, C, T, F = x.shape
-        x = x.reshape(B*N, C, T, F)
+        x = rearrange(x, "B N C T F->(B N) C T F")
         if not self.shape_reported:
             print("The shape of UNet input is", x.size())
             self.shape_reported = True
@@ -909,10 +910,13 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
+        emb = emb.unsqueeze(1).expand(-1, N, -1)
+        switch_emb = switch_emb.unsqueeze(0).expand(B, N, -1)
+
         if self.use_extra_film_by_addition:
             emb = emb + self.film_emb(y)
         elif self.use_extra_film_by_concat:
-            emb = th.cat([emb.expand(N, -1), switch_emb], dim=-1)
+            emb = th.cat([emb.reshape(B*N, -1), switch_emb.reshape(B*N, -1)], dim=-1)
 
         h = x.type(self.dtype)
         h, mix = th.chunk(h, chunks=2, dim=1)
@@ -942,9 +946,13 @@ class UNetModel(nn.Module):
             h = module(h, emb, context)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
-            return self.id_predictor(h)
+            out = id_predictor(h)
+            out = rearrange(out, "(B N) C T F->B N C T F", B=B)
+            return out
         else:
-            return self.out(h)
+            out = self.out(h)
+            out = rearrange(out, "(B N) C T F->B N C T F", B=B)
+            return out
 
 
 class EncoderUNetModel(nn.Module):

@@ -22,14 +22,15 @@ trainer:
     - 0
     # - 1
     # - 2
+    # - 3
 
 
 
 data:
   target: src.utilities.data.datamodule.DataModuleFromConfig
   params:
-    batch_size: 1 #16
-    num_workers: 1 #8
+    batch_size: 8 #16
+    num_workers: 2 #8
 
     augmentation:
       mixup: 0.0
