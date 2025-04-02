@@ -860,8 +860,9 @@ class UNetModel(nn.Module):
 
         self.shape_reported = False
 
-        self.switcher = nn.Parameter(th.eye(4), requires_grad=False)
-        self.switcher_transform = nn.Sequential(nn.Linear(4, 128), 
+        switcher = nn.Parameter(th.eye(4), requires_grad=False)
+        self.swither = th.cat([th.sin(switcher_class), th.cos(switcher_class)], dim=-1)
+        self.switcher_transform = nn.Sequential(nn.Linear(8, 128), 
         nn.ReLU(), 
         nn.Linear(128, time_embed_dim)
         )
