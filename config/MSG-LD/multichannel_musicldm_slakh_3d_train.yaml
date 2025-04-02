@@ -98,7 +98,7 @@ model:
     latent_t_size: 256 # TODO might need to change # (256, 16) or (128,16)
     latent_f_size: 16 
     channels: 8 # TODO might need to change # 8 or 16
-    cond_stage_trainable: true 
+    cond_stage_trainable: false 
     latent_mixup: 0.0
     conditioning_key: concat #film
     monitor: val/loss_simple_ema
@@ -114,8 +114,8 @@ model:
       target: latent_diffusion.modules.diffusionmodules.openaimodel.UNetModel
       params:
         image_size: 64 # Ignore this parameter
-        extra_film_use_concat: true
-        extra_film_condition_dim: 512
+        # extra_film_use_concat: true
+        # extra_film_condition_dim: 512
         # extra_film_use_concat: true   # TODO: not sure if we need this. Need to look mode carefully!!
         in_channels: 8 # TODO might need to change # 8 or 16
         out_channels: 8 # TODO might need to change # 8 or 16

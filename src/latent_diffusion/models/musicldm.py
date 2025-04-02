@@ -1065,7 +1065,10 @@ class MusicLDM(DDPM):
                 elif isinstance(c, (np.ndarray, torch.Tensor)) and len(c.shape) == 1:
                     c = self.cond_stage_model(c.unsqueeze(0))
                 else:
+                    # this branch
                     c = self.cond_stage_model(c)
+                    # encoder_posterior = self.encode_first_stage(c)
+                    # c = self.get_first_stage_encoding(encoder_posterior).detach()
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
@@ -1257,6 +1260,7 @@ class MusicLDM(DDPM):
         return_original_cond=False,
         bs=None
     ):
+        flag=0
         if self.training and self.latent_mixup > 0:
             # doing the mixup
             x = super().get_input(batch, k)
@@ -1284,6 +1288,7 @@ class MusicLDM(DDPM):
                 x[select_idx] = nx
                 x.to(self.device)
                 z.to(self.device)
+                flag=1
             else:
                 z = None
 
@@ -1307,6 +1312,7 @@ class MusicLDM(DDPM):
                         c = self.get_learned_conditioning(xc)
                     else:
                         c = self.get_learned_conditioning(xc.to(self.device))
+                        flag=2
                 else:
                     c = xc
                 if bs is not None:
@@ -1358,6 +1364,7 @@ class MusicLDM(DDPM):
                         c = self.get_learned_conditioning(xc)
                     else:
                         c = self.get_learned_conditioning(xc.to(self.device))
+                        flag=3
                 else:
                     c = xc
                 if bs is not None:
@@ -1369,6 +1376,9 @@ class MusicLDM(DDPM):
                 if self.use_positional_encodings:
                     pos_x, pos_y = self.compute_latent_shifts(batch)
                     c = {"pos_x": pos_x, "pos_y": pos_y}
+
+        assert z.shape[1]==4, print(z.shape, c.shape, flag)
+
         out = [z, c]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
@@ -2100,9 +2110,9 @@ class MusicLDM(DDPM):
     ):
 
         if mask is not None:
-            shape = (self.channels, self.z_channels, mask.size()[-2], mask.size()[-1])
+            shape = (self.z_channels, mask.size()[-2], mask.size()[-1])
         else:
-            shape = (self.channels, self.z_channels, self.latent_t_size, self.latent_f_size)
+            shape = (self.z_channels, self.latent_t_size, self.latent_f_size)
 
         intermediate = None
         if ddim and not use_plms:
@@ -2111,7 +2121,7 @@ class MusicLDM(DDPM):
             ddim_sampler = DDIMSampler(self)
             samples, intermediates = ddim_sampler.sample(
                 ddim_steps,
-                batch_size,
+                batch_size*4,
                 shape,
                 cond,
                 verbose=False,
@@ -2393,6 +2403,7 @@ class MusicLDM(DDPM):
 
                 fnames = list(super().get_input(batch, "fname"))
 
+                print(c.shape)
                 samples, _ = self.sample_log(
                     cond=c,
                     batch_size=batch_size,
@@ -3200,15 +3211,20 @@ class DiffusionWrapper(pl.LightningModule):
     ):
         x = x.contiguous()
         t = t.contiguous()
+        N = x.shape[1]
+        x = rearrange(x, "B N C T F -> (B N) C T F")
+        t = t.unsqueeze(1).repeat(1, N).view(-1)
 
         if self.conditioning_key is None:
             out = self.diffusion_model(x, t)
         elif self.conditioning_key == "concat":
-            xc = torch.cat([x] + c_concat, dim=2)
+            c_concat = c_concat[0]
+            c_concat = rearrange(c_concat, "B N C T F -> (B N) C T F")
+            xc = torch.cat([x] + [c_concat], dim=1)
             out = self.diffusion_model(xc, t)
         elif self.conditioning_key == "crossattn":
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
+            out = self.diffusion_model(x, t)
         elif self.conditioning_key == "hybrid":
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
@@ -3223,6 +3239,8 @@ class DiffusionWrapper(pl.LightningModule):
             out = self.diffusion_model(x, t, y=cc)
         else:
             raise NotImplementedError()
+        
+        out = rearrange(out, "(B N) C T F -> B N C T F", N=N)
 
         return out
 

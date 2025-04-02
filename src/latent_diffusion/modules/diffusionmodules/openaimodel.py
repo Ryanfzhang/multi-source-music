@@ -171,7 +171,7 @@ class Downsample(nn.Module):
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
     def forward(self, x):
-        assert x.shape[1] == self.channels
+        # assert x.shape[1] == self.channels, print(x.shape, self.channels)
         return self.op(x)
 
 
@@ -650,7 +650,7 @@ class UNetModel(nn.Module):
                 layers = [
                     ResBlock(
                         ch,
-                        time_embed_dim
+                        time_embed_dim * 2
                         if (not self.use_extra_film_by_concat)
                         else time_embed_dim * 2,
                         dropout,
@@ -703,7 +703,7 @@ class UNetModel(nn.Module):
                     TimestepEmbedSequential(
                         ResBlock(
                             ch,
-                            time_embed_dim
+                            time_embed_dim * 2
                             if (not self.use_extra_film_by_concat)
                             else time_embed_dim * 2,
                             dropout,
@@ -736,7 +736,7 @@ class UNetModel(nn.Module):
         self.middle_block = TimestepEmbedSequential(
             ResBlock(
                 ch,
-                time_embed_dim
+                time_embed_dim * 2
                 if (not self.use_extra_film_by_concat)
                 else time_embed_dim * 2,
                 dropout,
@@ -762,7 +762,7 @@ class UNetModel(nn.Module):
             ),
             ResBlock(
                 ch,
-                time_embed_dim
+                time_embed_dim * 2
                 if (not self.use_extra_film_by_concat)
                 else time_embed_dim * 2,
                 dropout,
@@ -782,7 +782,7 @@ class UNetModel(nn.Module):
                 layers = [
                     ResBlock(
                         ch + ich,
-                        time_embed_dim
+                        time_embed_dim * 2
                         if (not self.use_extra_film_by_concat)
                         else time_embed_dim * 2,
                         dropout,
@@ -829,7 +829,7 @@ class UNetModel(nn.Module):
                     layers.append(
                         ResBlock(
                             ch,
-                            time_embed_dim
+                            time_embed_dim * 2
                             if (not self.use_extra_film_by_concat)
                             else time_embed_dim * 2,
                             dropout,
@@ -860,8 +860,7 @@ class UNetModel(nn.Module):
 
         self.shape_reported = False
 
-        switcher = nn.Parameter(th.eye(4), requires_grad=False)
-        self.swither = th.cat([th.sin(switcher_class), th.cos(switcher_class)], dim=-1)
+        self.switcher = nn.Parameter(th.eye(4), requires_grad=False)
         self.switcher_transform = nn.Sequential(nn.Linear(8, 128), 
         nn.ReLU(), 
         nn.Linear(128, time_embed_dim)
@@ -892,8 +891,11 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional. an [N, extra_film_condition_dim] Tensor if film-embed conditional
         :return: an [N x C x ...] Tensor of outputs.
         """
-        B, N, C, T, F = x.shape
-        x = rearrange(x, "B N C T F->(B N) C T F")
+        B, C, T, F = x.shape
+        N = 4
+        B = B//4
+        # context = context.unsqueeze(1).expand(-1, N, -1, -1, -1)
+
         if not self.shape_reported:
             print("The shape of UNet input is", x.size())
             self.shape_reported = True
@@ -904,55 +906,40 @@ class UNetModel(nn.Module):
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
-        switch_emb = self.switcher_transform(self.switcher)
-
+        switcher = th.cat([th.sin(self.switcher), th.cos(self.switcher)], dim=-1)
+        switch_emb = self.switcher_transform(switcher)
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        emb = emb.unsqueeze(1).expand(-1, N, -1)
         switch_emb = switch_emb.unsqueeze(0).expand(B, N, -1)
 
         if self.use_extra_film_by_addition:
             emb = emb + self.film_emb(y)
         elif self.use_extra_film_by_concat:
             emb = th.cat([emb.reshape(B*N, -1), switch_emb.reshape(B*N, -1)], dim=-1)
+        else:
+            emb = th.cat([emb, switch_emb.reshape(B*N,-1)], dim=-1)
 
         h = x.type(self.dtype)
         h, mix = th.chunk(h, chunks=2, dim=1)
 
-        mix_list = []
-        mix = mix[:, 0:1, :, :]
-        mix_list.append(mix)
-        for i in range(len(self.downsample_layers)):
-            mix = self.downsample_layers[i](mix)
-            mix_list.append(mix)
-
-        # for module in self.input_blocks:
-        for i, module in enumerate(self.input_blocks):
-            mix_i = mix_list[i]
-            mix_to_add =  mix_i.repeat(1, h.shape[1], 1, 1)
-            h = h + mix_to_add        
+        h = h + mix
+        for module in self.input_blocks:
             h = module(h, emb, context)
             hs.append(h)
         h = self.middle_block(h, emb, context)
-        for i, module in enumerate(self.output_blocks):
+        for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-
-            mix_i = mix_list[len(mix_list)-i-1]
-            mix_to_add =  mix_i.repeat(1, h.shape[1], 1, 1)
-            h = h + mix_to_add
-
             h = module(h, emb, context)
         h = h.type(x.dtype)
+
         if self.predict_codebook_ids:
             out = id_predictor(h)
-            out = rearrange(out, "(B N) C T F->B N C T F", B=B)
             return out
         else:
             out = self.out(h)
-            out = rearrange(out, "(B N) C T F->B N C T F", B=B)
             return out
 
 
