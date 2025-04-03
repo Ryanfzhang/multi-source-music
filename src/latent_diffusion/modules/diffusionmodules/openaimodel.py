@@ -308,8 +308,6 @@ class ResBlock(TimestepBlock):
         )
 
     def _forward(self, x, emb):
-        N = emb.shape[0]
-        B = x.shape[0]//N
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -319,8 +317,7 @@ class ResBlock(TimestepBlock):
         else:
             h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
-        emb_out = emb_out[None, ..., None, None].expand(B, -1, -1, -1, -1)
-        emb_out = emb_out.reshape(x.shape[0], -1, 1, 1)
+        emb_out = emb_out[..., None, None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(emb_out, 2, dim=1)
@@ -862,7 +859,7 @@ class UNetModel(nn.Module):
 
         self.switcher = nn.Parameter(th.eye(4), requires_grad=False)
         self.switcher_transform = nn.Sequential(nn.Linear(8, 128), 
-        nn.ReLU(), 
+        nn.SiLU(), 
         nn.Linear(128, time_embed_dim)
         )
 
@@ -925,7 +922,7 @@ class UNetModel(nn.Module):
         h = x.type(self.dtype)
         h, mix = th.chunk(h, chunks=2, dim=1)
 
-        h = h + mix
+        # h = h + mix
         for module in self.input_blocks:
             h = module(h, emb, context)
             hs.append(h)
