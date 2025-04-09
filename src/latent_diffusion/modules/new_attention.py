@@ -4,9 +4,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
-
+import xformers
 from latent_diffusion.modules.diffusionmodules.util import checkpoint
-
+from diffusers.models.attention_processor import Attention
 
 def exists(val):
     return val is not None
@@ -381,6 +381,7 @@ class BasicTransformerBlock(nn.Module):
         self.attn1 = CrossAttention(
             query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout
         )  # is a self-attention
+        
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.attn2 = CrossAttention(
             query_dim=dim,
@@ -407,6 +408,192 @@ class BasicTransformerBlock(nn.Module):
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
+
+
+
+
+# class SpatialTransformer(nn.Module):
+#     """
+#     Transformer block for image-like data.
+#     First, project the input (aka embedding)
+#     and reshape to b, t, d.
+#     Then apply standard transformer action.
+#     Finally, reshape to image
+#     """
+
+#     def __init__(
+#         self,
+#         in_channels,
+#         n_heads,
+#         d_head,
+#         depth=1,
+#         dropout=0.0,
+#         context_dim=None,
+#         no_context=False,
+#     ):
+#         super().__init__()
+
+#         if no_context:
+#             context_dim = None
+
+#         self.in_channels = in_channels
+#         inner_dim = n_heads * d_head
+#         self.norm = Normalize(in_channels)
+
+#         self.proj_in = nn.Conv2d(
+#             in_channels, inner_dim, kernel_size=1, stride=1, padding=0
+#         )
+
+#         self.transformer_blocks = nn.ModuleList(
+#             [
+#                 BasicTransformerBlock(
+#                     inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim
+#                 )
+#                 for d in range(depth)
+#             ]
+#         )
+
+#         self.proj_out = zero_module(
+#             nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
+#         )
+
+#     def forward(self, x, context=None):
+#         # note: if no context is given, cross-attention defaults to self-attention
+#         b, c, h, w = x.shape
+#         x_in = x
+#         x = self.norm(x)
+#         x = self.proj_in(x)
+#         x = rearrange(x, "b c h w -> b (h w) c")
+#         for block in self.transformer_blocks:
+#             x = block(x, context=context)
+#         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
+#         x = self.proj_out(x)
+#         return x + x_in
+
+
+class XFormersJointAttnProcessor:
+    r"""
+    Default processor for performing attention-related computations.
+    """
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        temb=None,
+        num_tasks=4
+    ):
+        b, t, c = hidden_states.shape
+        s = 4
+        b = int(b / s)
+
+        residual = hidden_states # [B*4, H*W=9216, C=320]
+        hidden_states = rearrange(hidden_states, '(b s) t c -> (s b) t c', s=s)  # [4*B, T, C]
+        
+
+        query = attn.to_q(residual) # Linear(320->320), hidden_states [B*4, H*W=9216, C=320] -> [B*4, H*W=9216, C=320]
+
+        key = attn.to_k(hidden_states) # [4*B, H*W=9216, C=320]
+        value = attn.to_v(hidden_states) # [4*B, H*W=9216, C=320]
+
+        assert num_tasks == 4  # only support two tasks now
+
+        key_0, key_1, key_2, key_3 = torch.chunk(key, dim=0, chunks=4)  # keys shape (b t) d c, key0=[1,9216,320], key1=[1,9216,320], key2=[1,9216,320], key3=[1,9216,320]
+        value_0, value_1, value_2, value_3 = torch.chunk(value, dim=0, chunks=4) # value0=[1,9216,320], value1=[1,9216,320], value2=[1,9216,320], value3=[1,9216,320]
+        
+        key = torch.cat([key_0, key_1, key_2, key_3], dim=1)  # (b t) 4d c  [1, 4*9216, 320]
+        value = torch.cat([value_0, value_1, value_2, value_3], dim=1)  # (b t) 4d c
+        key = torch.cat([key]*4, dim=0)   # [B*4, 9216*4, 320]
+        value = torch.cat([value]*4, dim=0)  # [B*4, 9216*4, 320]
+
+        query = attn.head_to_batch_dim(query).contiguous() # [4, 9216, 320] -> [4*5, 9216, 64] 10=num_heads*2 64=320/num_heads=320/5 
+        key = attn.head_to_batch_dim(key).contiguous() # '\n        Reshape the tensor from `[batch_size, seq_len, dim]` to `[batch_size, seq_len, heads, dim // heads]` `heads` is the number of heads initialized while constructing the `Attention` class.\n\n        Args:\n            tensor (`torch.Tensor`): The tensor to reshape.\n            out_dim (`int`, *optional*, defaults to `3`): The output dimension of the tensor. If `3`, the tensor is\n                reshaped to `[batch_size * heads, seq_len, dim // heads]`.\n\n  
+        value = attn.head_to_batch_dim(value).contiguous() # [4, 9216*4, 320] -> [4*5, 9216*4, 64]
+
+        hidden_states = xformers.ops.memory_efficient_attention(query, key, value, attn_bias=attention_mask) # [B*4*5, 9216, 64]
+        hidden_states = attn.batch_to_head_dim(hidden_states) # [B*4, 9216, 320]
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states) # [4, 9216, 320]
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states) # [4, 9216, 320]
+
+        attn.residual_connection = True
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        
+        return hidden_states
+
+
+class CustomJointAttention(Attention):
+    def set_use_memory_efficient_attention_xformers(
+        self, use_memory_efficient_attention_xformers: bool, *args, **kwargs
+    ):  
+        processor = XFormersJointAttnProcessor()
+        self.set_processor(processor)
+        print("using xformers attention processor")
+
+
+
+class CustomTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        dropout=0.0,
+        context_dim=None,
+        gated_ff=True,
+        checkpoint=True,
+    ):
+        super().__init__()
+        # self.attn1 = CrossAttention(
+        #     query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        # )  # is a self-attention
+
+        self.attn1 = CustomJointAttention( 
+            query_dim=dim, # 320 C
+            heads=n_heads, # 5
+            dim_head=d_head, # 64
+            dropout=dropout, # 0.0
+            bias=False, # False
+            cross_attention_dim=None, # None
+            upcast_attention=False, # False
+            out_bias=True # True
+        ) #  x = b (h w) c
+        
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.attn2 = CrossAttention(
+            query_dim=dim,
+            context_dim=context_dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+        )  # is self-attn if context is none
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.checkpoint = checkpoint
+        self.attn1.set_use_memory_efficient_attention_xformers(True)
+
+    def forward(self, x, context=None):
+        if context is None:
+            return checkpoint(self._forward, (x,), self.parameters(), self.checkpoint)
+        else:
+            return checkpoint(
+                self._forward, (x, context), self.parameters(), self.checkpoint
+            )
+
+    def _forward(self, x, context=None):
+        x = self.attn1(self.norm1(x)) + x
+        x = self.attn2(self.norm2(x), context=context) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
 
 
 class SpatialTransformer(nn.Module):
@@ -443,7 +630,7 @@ class SpatialTransformer(nn.Module):
 
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlock(
+                CustomTransformerBlock(
                     inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim
                 )
                 for d in range(depth)
@@ -453,16 +640,25 @@ class SpatialTransformer(nn.Module):
         self.proj_out = zero_module(
             nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
         )
+        
 
     def forward(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
-        b, c, h, w = x.shape
+        b, c, h, w = x.shape # b = 4*B
         x_in = x
-        x = self.norm(x)
-        x = self.proj_in(x)
-        x = rearrange(x, "b c h w -> b (h w) c")
+
+        x = self.norm(x) # x [4B, C, H, W]
+        x = self.proj_in(x)  # [4B, C, H, W]
+
+        # 转换为序列
+        x = rearrange(x, "b c h w -> b (h w) c") # [4B, H*W, C]
+        
+        # 处理每个 Transformer Block
         for block in self.transformer_blocks:
             x = block(x, context=context)
+        
+        # 恢复原始形状 [4B, C, H, W]
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         x = self.proj_out(x)
         return x + x_in
+    
